@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.ContactsContract
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -42,7 +43,11 @@ import com.postly.app.data.model.RepeatRule
 import com.postly.app.data.model.ScheduleEntity
 import com.postly.app.data.model.ScheduleStatus
 import com.postly.app.service.PostlyAccessibilityService
+import com.postly.app.util.AttachmentStore
 import com.postly.app.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -120,66 +125,45 @@ fun CreateScheduleScreen(
         return Pair(name, sizeStr)
     }
 
+    // Copies the picked file into app storage so it is still readable when the alarm fires
+    val attachmentScope = rememberCoroutineScope()
+    var isImportingAttachment by remember { mutableStateOf(false) }
+    fun onAttachmentPicked(uri: Uri?, type: String) {
+        if (uri == null) return
+        val (name, size) = getFileInfo(uri)
+        isImportingAttachment = true
+        attachmentScope.launch {
+            val stored = withContext(Dispatchers.IO) {
+                AttachmentStore.importAttachment(context.applicationContext, uri, name)
+            }
+            isImportingAttachment = false
+            if (stored == null) {
+                Toast.makeText(context, "Couldn't attach that file. Please try another one.", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            attachmentUri = stored.toString()
+            attachmentType = type
+            attachmentName = name
+            attachmentSize = size
+        }
+    }
+
     // Launchers for various attachment types
     val imageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: Exception) {}
-            val (name, size) = getFileInfo(uri)
-            attachmentUri = uri.toString()
-            attachmentType = "IMAGE"
-            attachmentName = name
-            attachmentSize = size
-        }
-    }
+    ) { uri: Uri? -> onAttachmentPicked(uri, "IMAGE") }
 
     val videoLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: Exception) {}
-            val (name, size) = getFileInfo(uri)
-            attachmentUri = uri.toString()
-            attachmentType = "VIDEO"
-            attachmentName = name
-            attachmentSize = size
-        }
-    }
+    ) { uri: Uri? -> onAttachmentPicked(uri, "VIDEO") }
 
     val docLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: Exception) {}
-            val (name, size) = getFileInfo(uri)
-            attachmentUri = uri.toString()
-            attachmentType = "DOCUMENT"
-            attachmentName = name
-            attachmentSize = size
-        }
-    }
+    ) { uri: Uri? -> onAttachmentPicked(uri, "DOCUMENT") }
 
     val audioLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: Exception) {}
-            val (name, size) = getFileInfo(uri)
-            attachmentUri = uri.toString()
-            attachmentType = "AUDIO"
-            attachmentName = name
-            attachmentSize = size
-        }
-    }
+    ) { uri: Uri? -> onAttachmentPicked(uri, "AUDIO") }
 
     // System Phonebook Picker Launcher
     val contactPickerLauncher = rememberLauncherForActivityResult(
@@ -595,7 +579,11 @@ fun CreateScheduleScreen(
                                 Icon(Icons.Default.AttachFile, null, tint = Color.White, modifier = Modifier.size(18.dp))
                             }
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text(if (attachmentUri != null) "1/1" else "0/1", fontSize = 13.sp, color = TextSecondary)
+                            if (isImportingAttachment) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            } else {
+                                Text(if (attachmentUri != null) "1/1" else "0/1", fontSize = 13.sp, color = TextSecondary)
+                            }
                         }
                     }
 

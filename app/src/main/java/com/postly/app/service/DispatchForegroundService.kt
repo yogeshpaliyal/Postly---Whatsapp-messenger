@@ -4,7 +4,6 @@ import android.app.KeyguardManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -17,7 +16,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.net.URLEncoder
 
 class DispatchForegroundService : Service() {
 
@@ -72,7 +70,7 @@ class DispatchForegroundService : Service() {
             }
 
             // Launch targeted WhatsApp
-            launchTargetedWhatsApp(schedule.recipientPhone, schedule.message, schedule.platform)
+            WhatsAppLauncher.launch(applicationContext, schedule)
 
             // Keep service alive to allow accessibility service to finish typing & clicking
             delay(20000)
@@ -106,35 +104,6 @@ class DispatchForegroundService : Service() {
             .build()
 
         startForeground(NOTIFICATION_ID, notification)
-    }
-
-    private fun launchTargetedWhatsApp(phoneNumber: String, message: String, platform: String) {
-        try {
-            val cleanPhone = phoneNumber.replace("+", "").replace(" ", "").replace("-", "")
-            val targetPkg = if (platform.contains("business", ignoreCase = true)) "com.whatsapp.w4b" else "com.whatsapp"
-
-            val intent = if (cleanPhone.isNotEmpty()) {
-                val encodedMsg = URLEncoder.encode(message, "UTF-8")
-                val uri = Uri.parse("whatsapp://send?phone=$cleanPhone&text=$encodedMsg")
-                Intent(Intent.ACTION_VIEW, uri).apply {
-                    setPackage(targetPkg)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
-            } else {
-                packageManager.getLaunchIntentForPackage(targetPkg)?.apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
-            }
-
-            if (intent != null) {
-                startActivity(intent)
-                Log.d(TAG, "Targeted WhatsApp opened for: $cleanPhone")
-            } else {
-                Log.e(TAG, "WhatsApp is not installed on this device")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch targeted WhatsApp", e)
-        }
     }
 
     private fun acquireWakeLock() {

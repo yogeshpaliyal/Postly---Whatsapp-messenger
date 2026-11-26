@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -19,7 +18,6 @@ import com.postly.app.MainActivity
 import com.postly.app.PostlyApplication
 import com.postly.app.data.model.ScheduleEntity
 import kotlinx.coroutines.*
-import java.net.URLEncoder
 
 enum class AutomationStep {
     IDLE,
@@ -292,8 +290,29 @@ class PostlyAccessibilityService : AccessibilityService() {
                 // 1. Wait for WhatsApp to settle
                 delay(1000)
 
-                val cleanPhone = task.recipientPhone.replace("+", "").replace(" ", "").replace("-", "")
+                val cleanPhone = WhatsAppLauncher.cleanPhone(task.recipientPhone)
                 val needsSearch = cleanPhone.isEmpty() && task.recipientName.isNotEmpty()
+
+                // Image / media messages go through WhatsApp's share flow instead of the chat box
+                if (WhatsAppLauncher.hasAttachment(task)) {
+                    val error = sendWithAttachment(task, needsSearch)
+                    if (error != null) {
+                        Log.e(TAG, "Attachment send failed: $error")
+                        RetryManager.handleFailure(applicationContext, task, error)
+                        pendingTask = null
+                        return@launch
+                    }
+                    withContext(Dispatchers.IO) {
+                        val db = (applicationContext as PostlyApplication).database
+                        db.scheduleDao().markDone(task.id, System.currentTimeMillis())
+                        AlarmScheduler.handleRecurringSchedule(applicationContext, task)
+                    }
+                    pendingTask = null
+                    Log.d(TAG, "WhatsApp message with attachment sent. Task marked DONE.")
+                    delay(1500)
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    return@launch
+                }
 
                 if (needsSearch) {
                     val opened = searchAndOpenContact(task.recipientName)
@@ -397,6 +416,120 @@ class PostlyAccessibilityService : AccessibilityService() {
                 isExecutingAutomation = false
             }
         }
+    }
+
+    /**
+     * Sends a scheduled attachment (e.g. an image) via WhatsApp's ACTION_SEND flow.
+     *
+     * With a phone number WhatsApp opens the media preview for that chat directly.
+     * With only a name it first shows the "Send to" picker, where we search the contact,
+     * select it and tap the send FAB to reach the media preview.
+     *
+     * @return null on success, otherwise a failure reason for RetryManager.
+     */
+    private suspend fun sendWithAttachment(task: ScheduleEntity, needsSearch: Boolean): String? {
+        if (needsSearch) {
+            if (!searchAndOpenContact(task.recipientName)) {
+                return "Contact '${task.recipientName}' not found in WhatsApp share list"
+            }
+            delay(500)
+            if (!clickSendButtonNode()) {
+                return "Could not confirm recipient in WhatsApp share list"
+            }
+            delay(1200)
+        }
+
+        // Wait for the media preview (caption box) to show up
+        var caption: AccessibilityNodeInfo? = null
+        for (attempt in 1..15) {
+            val root = rootInActiveWindow
+            if (root != null) {
+                caption = findCaptionNode(root)
+                if (caption != null) break
+            }
+            delay(300)
+        }
+
+        if (caption == null) {
+            // Some WhatsApp builds have no caption box for certain media; still try to send.
+            Log.w(TAG, "Caption box not found on media preview, trying Send anyway")
+        } else if (task.message.isNotBlank()) {
+            // EXTRA_TEXT usually prefills the caption; fill it ourselves if it didn't.
+            val existing = if (caption.isShowingHintText) "" else caption.text?.toString().orEmpty()
+            if (existing.trim() != task.message.trim()) {
+                caption.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                delay(150)
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, task.message)
+                }
+                if (!caption.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                    copyToClipboard(task.message)
+                    delay(100)
+                    caption.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                }
+                delay(300)
+            }
+        }
+
+        delay(300)
+        if (!clickSendButtonNode()) {
+            return "Send button not found on WhatsApp media preview"
+        }
+        // Give WhatsApp a moment to queue the upload before we navigate away
+        delay(1500)
+        return null
+    }
+
+    /** Finds and clicks WhatsApp's Send button (node click, then tap on its bounds). */
+    private suspend fun clickSendButtonNode(): Boolean {
+        for (attempt in 1..8) {
+            val root = rootInActiveWindow
+            if (root != null) {
+                val sendBtn = findWhatsAppSendButton(root)
+                if (sendBtn != null) {
+                    if (sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                    val rect = Rect()
+                    sendBtn.getBoundsInScreen(rect)
+                    if (rect.centerX() > 0) {
+                        clickAt(rect.centerX().toFloat(), rect.centerY().toFloat())
+                        return true
+                    }
+                }
+            }
+            delay(300)
+        }
+        return false
+    }
+
+    /** Caption field on WhatsApp's media preview screen. */
+    private fun findCaptionNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val ids = listOf(
+            "com.whatsapp:id/caption",
+            "com.whatsapp.w4b:id/caption",
+            "com.whatsapp:id/media_caption",
+            "com.whatsapp.w4b:id/media_caption"
+        )
+        for (id in ids) {
+            val list = root.findAccessibilityNodeInfosByViewId(id)
+            if (!list.isNullOrEmpty()) return list[0]
+        }
+        return scanForCaption(root)
+    }
+
+    private fun scanForCaption(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (node.className?.contains("EditText") == true) {
+            val id = node.viewIdResourceName ?: ""
+            val hint = node.hintText?.toString() ?: ""
+            if (id.contains("caption", ignoreCase = true) || hint.contains("caption", ignoreCase = true)) {
+                return node
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = scanForCaption(child)
+            if (found != null) return found
+        }
+        return null
     }
 
     private suspend fun searchAndOpenContact(targetName: String): Boolean {
@@ -611,7 +744,10 @@ class PostlyAccessibilityService : AccessibilityService() {
         // 1. Strict match on chat row contact name view IDs
         val rowContactIds = listOf(
             "com.whatsapp:id/conversations_row_contact_name",
-            "com.whatsapp.w4b:id/conversations_row_contact_name"
+            "com.whatsapp.w4b:id/conversations_row_contact_name",
+            // "Send to" share picker rows (used for attachments)
+            "com.whatsapp:id/contactpicker_row_name",
+            "com.whatsapp.w4b:id/contactpicker_row_name"
         )
         for (id in rowContactIds) {
             val list = root.findAccessibilityNodeInfosByViewId(id)
@@ -735,52 +871,8 @@ class PostlyAccessibilityService : AccessibilityService() {
     }
 
     fun launchWhatsAppTarget(task: ScheduleEntity) {
-        try {
-            val cleanPhone = task.recipientPhone.replace("+", "").replace(" ", "").replace("-", "")
-            val targetPkg = if (task.platform.contains("business", ignoreCase = true)) "com.whatsapp.w4b" else "com.whatsapp"
-
-            val intent = if (!task.attachmentUri.isNullOrBlank()) {
-                val mediaUri = Uri.parse(task.attachmentUri)
-                val mimeType = when (task.attachmentType) {
-                    "IMAGE" -> "image/*"
-                    "VIDEO" -> "video/*"
-                    "AUDIO" -> "audio/*"
-                    else -> "*/*"
-                }
-                Intent(Intent.ACTION_SEND).apply {
-                    setPackage(targetPkg)
-                    type = mimeType
-                    putExtra(Intent.EXTRA_STREAM, mediaUri)
-                    if (task.message.isNotBlank()) {
-                        putExtra(Intent.EXTRA_TEXT, task.message)
-                    }
-                    if (cleanPhone.isNotEmpty()) {
-                        putExtra("jid", "$cleanPhone@s.whatsapp.net")
-                    }
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
-            } else if (cleanPhone.isNotEmpty()) {
-                val encodedMsg = URLEncoder.encode(task.message, "UTF-8")
-                val uri = Uri.parse("whatsapp://send?phone=$cleanPhone&text=$encodedMsg")
-                Intent(Intent.ACTION_VIEW, uri).apply {
-                    setPackage(targetPkg)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
-            } else {
-                packageManager.getLaunchIntentForPackage(targetPkg)?.apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
-            }
-
-            if (intent != null) {
-                currentStep = AutomationStep.START
-                startActivity(intent)
-                Log.d(TAG, "Launched WhatsApp (attachment: ${!task.attachmentUri.isNullOrBlank()}). State initialized to START.")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch WhatsApp", e)
-        }
+        currentStep = AutomationStep.START
+        WhatsAppLauncher.launch(applicationContext, task)
     }
 
     override fun onInterrupt() {
