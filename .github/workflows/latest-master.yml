@@ -1,0 +1,76 @@
+name: Build latest-master APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Only one release update at a time; a newer push cancels an older in-progress build.
+concurrency:
+  group: latest-master
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: latest-master
+      APK_NAME: Postly-latest-master.apk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Collect APK
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then echo "No APK produced"; exit 1; fi
+          cp "$APK" "$APK_NAME"
+          ls -lh "$APK_NAME"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postly-debug-apk
+          path: ${{ env.APK_NAME }}
+          retention-days: 14
+
+      - name: Publish latest-master prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          COMMIT_TITLE="${COMMIT_MSG%%$'\n'*}"
+          [ -z "$COMMIT_TITLE" ] && COMMIT_TITLE="manual run"
+          BUILT_AT=$(date -u +"%Y-%m-%d %H:%M UTC")
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          NOTES=$(printf 'Automated debug build from `%s` at %s.\n\nCommit: %s\n\nBuilt: %s · [Workflow run](%s)\n' \
+            "$GITHUB_REF_NAME" "$SHORT_SHA" "$COMMIT_TITLE" "$BUILT_AT" "$RUN_URL")
+
+          # Replace the previous prerelease and move the tag to this commit
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
+          git push origin ":refs/tags/$RELEASE_TAG" || true
+
+          gh release create "$RELEASE_TAG" "$APK_NAME" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest master (${SHORT_SHA})" \
+            --notes "$NOTES"
